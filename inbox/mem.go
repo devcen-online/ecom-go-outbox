@@ -85,7 +85,27 @@ func (s *MemStore) InsertIfAbsent(ctx context.Context, tx Tx, ev *InboxEvent) (b
 	return true, nil
 }
 
-func (s *MemStore) MarkProcessed(ctx context.Context, eventID string) error {
+// TouchAttempts инкрементирует attempts при повторе Nats-Msg-Id (INV-4).
+// Вызывается в транзакции tx: изменения коммитятся вместе с ней.
+func (s *MemStore) TouchAttempts(ctx context.Context, tx Tx, eventID string, attempts int) error {
+	t, ok := tx.(*memTx)
+	if !ok {
+		return fmt.Errorf("inbox: неверный тип транзакции %T", tx)
+	}
+	t.store.mu.Lock()
+	defer t.store.mu.Unlock()
+	if t.done {
+		return errors.New("inbox: транзакция уже завершена")
+	}
+	ev, exists := t.staged.events[eventID]
+	if !exists {
+		return fmt.Errorf("inbox: событие %s не найдено", eventID)
+	}
+	ev.Attempts = attempts // payload и status первого доставления не меняются (INV-2, S-5)
+	return nil
+}
+
+func (s *MemStore) MarkProcessed(ctx context.Context, eventID string, attempts int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ev, ok := s.events[eventID]
@@ -93,6 +113,7 @@ func (s *MemStore) MarkProcessed(ctx context.Context, eventID string) error {
 		return fmt.Errorf("inbox: событие %s не найдено", eventID)
 	}
 	ev.Status = StatusProcessed
+	ev.Attempts = attempts
 	t := time.Now().UTC()
 	ev.ProcessedAt = &t
 	return nil

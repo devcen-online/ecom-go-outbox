@@ -5,7 +5,6 @@ package relay
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 
@@ -115,6 +114,3 @@ func (r *Relay) Run(ctx context.Context) (int, error) {
 	}
 	return published, nil
 }
-
-// ErrUnpublished — ошибка, когда ни одно событие не опубликовано.
-var ErrUnpublished = errors.New("relay: не опубликовано ни одного события")

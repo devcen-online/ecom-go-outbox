@@ -40,14 +40,24 @@ type Tx interface {
 
 // Store — репозиторий inbox. PostgreSQL-реализация подключается отдельным
 // пакетом; in-memory реализация (MemStore) — для unit-тестов.
+//
+// Жизненный цикл записи (ERD-OB-001, сущность InboxEvent):
+//   - InsertIfAbsent: received (первая доставка, attempts = DeliveryCount);
+//   - дубль Nats-Msg-Id: TouchAttempts — attempts инкрементируется каждой
+//     доставкой (INV-4), status и payload первого доставления не меняются (INV-2, S-5);
+//   - успешная обработка: MarkProcessed — processed, processed_at, attempts (INV-6).
 type Store interface {
 	BeginTx(ctx context.Context) (Tx, error)
 	// InsertIfAbsent — INSERT ... ON CONFLICT (event_id) DO NOTHING в той же
 	// транзакции, что и бизнес-обработка (INV-2). Возвращает inserted=true,
 	// если запись создана (событие новое), false — если дубль уже существует.
 	InsertIfAbsent(ctx context.Context, tx Tx, ev *InboxEvent) (bool, error)
-	// MarkProcessed фиксирует успешную обработку и коммит транзакции.
-	MarkProcessed(ctx context.Context, eventID string) error
+	// TouchAttempts фиксирует число доставок при повторе Nats-Msg-Id (INV-4:
+	// attempts инкрементируется каждой доставкой); вызывается в транзакции tx.
+	TouchAttempts(ctx context.Context, tx Tx, eventID string, attempts int) error
+	// MarkProcessed фиксирует успешную обработку и коммит транзакции
+	// (status → processed, attempts, processed_at = now).
+	MarkProcessed(ctx context.Context, eventID string, attempts int) error
 	// LastAggregateVersion возвращает максимальную применённую версию агрегата
 	// (INV-6, BDD-033#S-4). ok=false, если события для агрегата ещё не было.
 	LastAggregateVersion(ctx context.Context, aggregateID string) (int64, bool, error)

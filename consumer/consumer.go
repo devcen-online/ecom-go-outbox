@@ -3,6 +3,10 @@
 // INV-3). При ошибке обработки — ROLLBACK → NACK (redelivery, FR-004).
 // Сбой между COMMIT и ACK безопасен: redelivery отсекается уникальным
 // inbox_events.event_id (FR-007, INV-7).
+//
+// Жизненный цикл записи inbox (ERD-OB-001): InsertIfAbsent → received
+// (attempts = DeliveryCount); дубль Nats-Msg-Id → TouchAttempts (attempts
+// инкрементируется, INV-4); успех → MarkProcessed (processed, processed_at).
 package consumer
 
 import (
@@ -100,9 +104,11 @@ func New(is inbox.Store, h Handler, cfg Config) *Consumer {
 
 // Handle обрабатывает одно сообщение по протоколу ADR-001:
 //
-//	BEGIN → InsertIfAbsent → (дубль: лог «duplicate ignored», ACK, выход)
-//	→ обработчик → COMMIT → [AfterCommit] → ACK
+//	BEGIN → InsertIfAbsent → (дубль: TouchAttempts → COMMIT → лог, ACK, выход)
+//	→ (stale: LastAggregateVersion ≥ event → COMMIT → MarkProcessed → лог, ACK, выход)
+//	→ обработчик → COMMIT → MarkProcessed → [AfterCommit] → ACK
 //	ошибка обработчика → ROLLBACK → NACK
+//	невалидный конверт → dead-letter (Term), без Ack (FR-005)
 //
 // В порядке операций commit всегда раньше ack (FR-006, BDD-033#S-10).
 func (c *Consumer) Handle(ctx context.Context, m Message) error {
@@ -114,10 +120,11 @@ func (c *Consumer) Handle(ctx context.Context, m Message) error {
 
 	env, err := envelope.Parse(m.Data())
 	if err != nil {
-		// Сообщение без валидного конверта: nack вернёт то же самое —
-		// подтверждаем и фиксируем в логе, исключая молчаливую потерю (FR-005).
+		// Сообщение без валидного конверта: повторная доставка вернёт то же
+		// самое, поэтому не ack-им — переводим в dead-letter (INV-5, FR-005),
+		// исключая молчаливую потерю.
 		c.logger.Printf("invalid envelope event_id=%s: %v", eventID, err)
-		return m.Ack()
+		return c.moveToDeadLetter(ctx, m, eventID, fmt.Errorf("invalid envelope: %w", err))
 	}
 
 	tx, err := c.inbox.BeginTx(ctx)
@@ -132,7 +139,7 @@ func (c *Consumer) Handle(ctx context.Context, m Message) error {
 		Topic:            m.Subject(),
 		Payload:          m.Data(),
 		Status:           inbox.StatusReceived,
-		Attempts:         0,
+		Attempts:         int(m.DeliveryCount()), // первая доставка = 1
 		CreatedAt:        time.Now().UTC(),
 	}
 	inserted, err := c.inbox.InsertIfAbsent(ctx, tx, record)
@@ -143,9 +150,35 @@ func (c *Consumer) Handle(ctx context.Context, m Message) error {
 	if !inserted {
 		// INV-2 (FR-002, S-3, S-5): дубль Nats-Msg-Id — обработчик не вызывается,
 		// лог «duplicate ignored» с id (NFR-004). Запись (payload первого
-		// доставления) не меняется.
+		// доставления) не меняется; attempts инкрементируется (INV-4).
+		if err := c.inbox.TouchAttempts(ctx, tx, eventID, int(m.DeliveryCount())); err != nil {
+			_ = tx.Rollback(ctx)
+			return fmt.Errorf("consumer: touch attempts: %w", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			c.logger.Printf("commit failed event_id=%s: %v", eventID, err)
+			return m.Nack()
+		}
+		c.logger.Printf("duplicate ignored event_id=%s attempts=%d", eventID, m.DeliveryCount())
+		return m.Ack()
+	}
+
+	// INV-6 (S-4): событие с версией ≤ применённой не откатывает read model.
+	// Запись фиксируется (доставка зафиксирована), обработчик не вызывается.
+	if last, ok, err := c.inbox.LastAggregateVersion(ctx, env.AggregateID); err != nil {
 		_ = tx.Rollback(ctx)
-		c.logger.Printf("duplicate ignored event_id=%s", eventID)
+		return fmt.Errorf("consumer: last aggregate version: %w", err)
+	} else if ok && env.AggregateVersion <= last {
+		if err := tx.Commit(ctx); err != nil {
+			c.logger.Printf("commit failed event_id=%s: %v", eventID, err)
+			return m.Nack()
+		}
+		if err := c.inbox.MarkProcessed(ctx, eventID, int(m.DeliveryCount())); err != nil {
+			c.logger.Printf("mark processed failed event_id=%s: %v", eventID, err)
+			return m.Nack()
+		}
+		c.logger.Printf("stale event ignored event_id=%s aggregate_id=%s version=%d last=%d",
+			eventID, env.AggregateID, env.AggregateVersion, last)
 		return m.Ack()
 	}
 
@@ -164,7 +197,13 @@ func (c *Consumer) Handle(ctx context.Context, m Message) error {
 		c.logger.Printf("commit failed event_id=%s: %v", eventID, err)
 		return m.Nack()
 	}
-	// COMMIT выполнен — далее ACK (INV-3: порядок commit → ack).
+	// COMMIT выполнен — фиксируем processed + processed_at (ERD-OB-001,
+	// INV-6); сбой здесь безопасен: redelivery отсекается идемпотентностью.
+	if err := c.inbox.MarkProcessed(ctx, eventID, int(m.DeliveryCount())); err != nil {
+		c.logger.Printf("mark processed failed event_id=%s: %v", eventID, err)
+		return m.Nack()
+	}
+	// Далее ACK (INV-3: порядок commit → ack).
 	if c.after != nil {
 		c.after() // fault injection S-11: «crash after commit, before ack»
 	}
