@@ -126,6 +126,12 @@ func (c *Consumer) Handle(ctx context.Context, m Message) error {
 		c.logger.Printf("invalid envelope event_id=%s: %v", eventID, err)
 		return c.moveToDeadLetter(ctx, m, eventID, fmt.Errorf("invalid envelope: %w", err))
 	}
+	// INV-2: Nats-Msg-Id должен совпадать с envelope.event_id (ERD-OB-001).
+	// Расхождение — ошибка контракта на стороне publisher; idempotency-ключ был бы неверным.
+	if env.EventID != eventID {
+		c.logger.Printf("event_id mismatch envelope=%s nats_msg_id=%s", env.EventID, eventID)
+		return c.moveToDeadLetter(ctx, m, eventID, fmt.Errorf("event_id mismatch: envelope=%s header=%s", env.EventID, eventID))
+	}
 
 	tx, err := c.inbox.BeginTx(ctx)
 	if err != nil {
@@ -157,6 +163,13 @@ func (c *Consumer) Handle(ctx context.Context, m Message) error {
 		}
 		if err := tx.Commit(ctx); err != nil {
 			c.logger.Printf("commit failed event_id=%s: %v", eventID, err)
+			return m.Nack()
+		}
+		// Гарантируем processed-статус: если первая доставка упала между Commit
+		// и MarkProcessed, redelivery приходит сюда со старым status=received;
+		// повторный вызов MarkProcessed идемпотентен.
+		if err := c.inbox.MarkProcessed(ctx, eventID, int(m.DeliveryCount())); err != nil {
+			c.logger.Printf("mark processed failed event_id=%s: %v", eventID, err)
 			return m.Nack()
 		}
 		c.logger.Printf("duplicate ignored event_id=%s attempts=%d", eventID, m.DeliveryCount())

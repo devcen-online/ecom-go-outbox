@@ -428,6 +428,49 @@ func TestMissingMsgID(t *testing.T) {
 	}
 }
 
+// INV-2: Nats-Msg-Id != envelope.event_id — ошибка контракта publisher,
+// idempotency-ключ был бы неверным → dead-letter + term.
+func TestMismatchedEventIDGoesToDeadLetter(t *testing.T) {
+	logc := &captureLog{}
+	dl := &fakeDLSink{}
+	c, store, _ := newConsumer(t, func(ctx context.Context, payload []byte) error { return nil }, nil, logc)
+	c.dlSink = dl
+
+	ctx := context.Background()
+	headerID := "11111111-1111-4111-8111-111111111111"
+	envelopeID := "22222222-2222-4222-8222-222222222222"
+	msg := &fakeMsg{
+		subject:       "ecom.test.catalog.product.created.v1",
+		data:          envelopeBytes(envelopeID, "ecom.catalog.product.created.v1", "product:p-1", 1, `{"name":"p-1"}`),
+		headers:       map[string]string{"Nats-Msg-Id": headerID},
+		deliveryCount: 1,
+		order:         &[]string{},
+	}
+	if err := c.Handle(ctx, msg); err != nil {
+		t.Fatal(err)
+	}
+	if !msg.termed || msg.acked || msg.nacked {
+		t.Fatalf("termed=%v acked=%v nacked=%v, want только term (dead-letter)", msg.termed, msg.acked, msg.nacked)
+	}
+	if len(dl.messages) != 1 {
+		t.Fatalf("dead-letter публикаций = %d, want 1", len(dl.messages))
+	}
+	dlm := dl.messages[0]
+	if dlm.EventID != headerID {
+		t.Fatalf("EventID dead-letter = %q, want headerID %s", dlm.EventID, headerID)
+	}
+	if !strings.Contains(dlm.Reason, "event_id mismatch") {
+		t.Fatalf("Reason = %q, want содержит 'event_id mismatch'", dlm.Reason)
+	}
+	if store.Count() != 0 {
+		t.Fatalf("inbox записей = %d, want 0 (mismatch не создаёт запись)", store.Count())
+	}
+	logOut := logc.String()
+	if !strings.Contains(logOut, "event_id mismatch") {
+		t.Fatalf("лог не содержит 'event_id mismatch': %q", logOut)
+	}
+}
+
 // minor-1 (FR-005, negative): невалидный конверт — не ack (повторная доставка
 // вернула бы то же самое), а dead-letter + term: тихой потери нет.
 func TestInvalidEnvelopeGoesToDeadLetter(t *testing.T) {

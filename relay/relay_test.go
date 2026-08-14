@@ -201,6 +201,75 @@ func TestLogsContainEventIDNotPayload(t *testing.T) {
 	}
 }
 
+// INV-9 (dead-letter): при исчерпании MaxPublishAttempts событие переходит
+// в dead-letter поток через DeadLetterSink (short-plan.md §1).
+func TestRunDeadLetterOnAttemptsExhausted(t *testing.T) {
+	store := setupStore(t, 1)
+	pub := &fakePub{failCount: 999}
+	dl := &fakeRelayDLSink{}
+	r := New(store, pub, Config{MaxPublishAttempts: 2, DeadLetterSink: dl}, nil)
+
+	// первый сбой — pending, attempts=1, dead-letter не должен активироваться
+	if _, err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(dl.messages) != 0 {
+		t.Fatalf("dead-letter после 1-й попытки = %d, want 0", len(dl.messages))
+	}
+
+	// второй сбой — attempts=2 >= max → MarkFailed + dead-letter
+	if _, err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(dl.messages) != 1 {
+		t.Fatalf("dead-letter сообщений = %d, want 1", len(dl.messages))
+	}
+	dlm := dl.messages[0]
+	if dlm.EventID != eventID(1) {
+		t.Fatalf("EventID dead-letter = %q, want %s", dlm.EventID, eventID(1))
+	}
+	if dlm.Attempts != 2 {
+		t.Fatalf("Attempts dead-letter = %d, want 2", dlm.Attempts)
+	}
+	if dlm.Subject != "ecom.test.catalog.product.updated.v1.dl" {
+		t.Fatalf("Subject dead-letter = %q, want '<topic>.dl'", dlm.Subject)
+	}
+	if dlm.Reason == "" {
+		t.Fatal("Reason dead-letter пуст")
+	}
+	ev, _ := store.Get(context.Background(), eventID(1))
+	if ev.Status != outbox.StatusFailed {
+		t.Fatalf("status = %s, want failed", ev.Status)
+	}
+}
+
+// INV-9 (dead-letter, pre-exhausted): событие уже имеет attempts >= max
+// при начале прохода — dead-letter срабатывает немедленно.
+func TestRunDeadLetterAlreadyExhausted(t *testing.T) {
+	store := setupStore(t, 1)
+	pub := &fakePub{failCount: 999}
+	dl := &fakeRelayDLSink{}
+	r := New(store, pub, Config{MaxPublishAttempts: 1, DeadLetterSink: dl}, nil)
+
+	// один проход — attempts=1 >= max=1 → failed + dead-letter
+	if _, err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(dl.messages) != 1 {
+		t.Fatalf("dead-letter сообщений = %d, want 1", len(dl.messages))
+	}
+}
+
+// fakeRelayDLSink — тестовый приёмник dead-letter для relay.
+type fakeRelayDLSink struct {
+	messages []*DeadLetterMessage
+}
+
+func (s *fakeRelayDLSink) PublishDeadLetter(_ context.Context, dl *DeadLetterMessage) error {
+	s.messages = append(s.messages, dl)
+	return nil
+}
+
 func testLogger(buf *strings.Builder) *log.Logger {
 	return log.New(buf, "", 0)
 }
