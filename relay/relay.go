@@ -34,6 +34,26 @@ type Publisher interface {
 	Publish(ctx context.Context, msg *Msg) error
 }
 
+// DeadLetterMessage — событие, исчерпавшее MaxPublishAttempts, для dead-letter потока
+// (short-plan.md §1): исходный payload + метаданные (причина, число попыток).
+type DeadLetterMessage struct {
+	// Subject — subject dead-letter потока (исходный топик + ".dl").
+	Subject string
+	// EventID — event_id события outbox.
+	EventID string
+	// Reason — причина перехода в dead-letter.
+	Reason string
+	// Attempts — число попыток публикации до исчерпания.
+	Attempts int
+	// Payload — исходный payload события.
+	Payload []byte
+}
+
+// DeadLetterSink публикует событие в dead-letter поток (адаптер JetStream — пакет js).
+type DeadLetterSink interface {
+	PublishDeadLetter(ctx context.Context, dl *DeadLetterMessage) error
+}
+
 // Config — конфигурация relay.
 type Config struct {
 	// MaxPublishAttempts — порог попыток публикации до статуса failed (INV-9).
@@ -41,20 +61,22 @@ type Config struct {
 	MaxPublishAttempts int
 	// BatchLimit — число событий за один проход Pending (0 → все pending).
 	BatchLimit int
+	// DeadLetterSink — публикация в dead-letter поток при исчерпании MaxPublishAttempts.
+	// Необязателен: если не задан, событие только помечается failed без публикации.
+	DeadLetterSink DeadLetterSink
 }
 
 // Relay публикует pending-события outbox в JetStream.
 type Relay struct {
-	store    outbox.Store
-	pub      Publisher
-	max      int
-	batch    int
-	logger   *log.Logger
-	onErrLog func(eventID string, err error)
+	store  outbox.Store
+	pub    Publisher
+	max    int
+	batch  int
+	logger *log.Logger
+	dlSink DeadLetterSink
 }
 
-// New создаёт relay. onErrLog — опциональный колбэк логирования ошибок
-// публикации (по умолчанию — логгер с event_id, без содержимого payload, NFR-004).
+// New создаёт relay.
 func New(store outbox.Store, pub Publisher, cfg Config, l *log.Logger) *Relay {
 	max := cfg.MaxPublishAttempts
 	if max <= 0 {
@@ -63,7 +85,7 @@ func New(store outbox.Store, pub Publisher, cfg Config, l *log.Logger) *Relay {
 	if l == nil {
 		l = log.New(log.Writer(), "outbox-relay: ", log.LstdFlags)
 	}
-	return &Relay{store: store, pub: pub, max: max, batch: cfg.BatchLimit, logger: l}
+	return &Relay{store: store, pub: pub, max: max, batch: cfg.BatchLimit, logger: l, dlSink: cfg.DeadLetterSink}
 }
 
 // Run выполняет один проход: читает pending-события, публикует каждое,
@@ -82,6 +104,7 @@ func (r *Relay) Run(ctx context.Context) (int, error) {
 				return published, fmt.Errorf("relay: mark failed %s: %w", ev.EventID, err)
 			}
 			r.logger.Printf("publish attempts exhausted event_id=%s attempts=%d max=%d", ev.EventID, ev.Attempts, r.max)
+			r.publishDeadLetter(ctx, ev.EventID, ev.Attempts, ev.Payload, ev.Topic)
 			continue
 		}
 		msg := &Msg{
@@ -96,6 +119,7 @@ func (r *Relay) Run(ctx context.Context) (int, error) {
 					return published, fmt.Errorf("relay: mark failed %s: %w", ev.EventID, err)
 				}
 				r.logger.Printf("publish failed attempts exhausted event_id=%s attempts=%d max=%d", ev.EventID, attempts, r.max)
+				r.publishDeadLetter(ctx, ev.EventID, attempts, ev.Payload, ev.Topic)
 			} else {
 				// INV-9: попытка не удалась — фиксируем счётчик, событие остаётся
 				// pending для следующего прохода (ретрай до MaxPublishAttempts).
@@ -113,4 +137,24 @@ func (r *Relay) Run(ctx context.Context) (int, error) {
 		published++
 	}
 	return published, nil
+}
+
+// publishDeadLetter отправляет событие в dead-letter поток, если sink настроен.
+// Ошибка публикации только логируется — событие уже помечено failed.
+func (r *Relay) publishDeadLetter(ctx context.Context, eventID string, attempts int, payload []byte, topic string) {
+	if r.dlSink == nil {
+		return
+	}
+	dl := &DeadLetterMessage{
+		Subject:  topic + ".dl",
+		EventID:  eventID,
+		Reason:   "publish attempts exhausted",
+		Attempts: attempts,
+		Payload:  payload,
+	}
+	if err := r.dlSink.PublishDeadLetter(ctx, dl); err != nil {
+		r.logger.Printf("dead-letter publish failed event_id=%s: %v", eventID, err)
+	} else {
+		r.logger.Printf("moved to dead-letter event_id=%s attempts=%d subject=%s", eventID, attempts, dl.Subject)
+	}
 }
